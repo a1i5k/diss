@@ -1,85 +1,105 @@
 """Список компаний для анализа.
 
-Раньше ИНН собирались с Мосбиржи (по тикерам); теперь берутся ВСЕ ИНН компаний из RFSD
-(Russian Financial Statements Database) за годы MIN_YEAR..MAX_YEAR. Тикеров и названий в RFSD нет,
-поэтому в возвращаемых записях 'ticker' и 'name' пустые, а основной идентификатор компании - 'inn'.
-Прежний сбор с Мосбиржи сохранён в collect_companies_data_moex().
+ИНН берутся с Мосбиржи (ISS): эмитенты облигаций, которые были допущены к торгам с MIN_YEAR года и позже
+(включая уже выбывшие выпуски; см. test.py). Отчётность по этим ИНН потом читается из RFSD (main.py -> rfsd.py).
+Основной идентификатор компании - 'inn'; в 'ticker' кладётся один из SECID выпусков эмитента, в 'name' -
+название эмитента с биржи.
+Прежний сбор ИНН по акциям (TQBR) сохранён в collect_companies_data_moex().
 """
 import time
 
-import rfsd
+import pandas as pd
+import requests
 
-OUTPUT_FILENAME = "rfsd_all_inns.csv"
+from config import MIN_YEAR
+
+OUTPUT_FILENAME = "moex_bond_issuers.csv"
+ISS = "https://iss.moex.com/iss"
+
+
+def _fetch(session, path, block, params=None, pause=0.3):
+    """Постраничная выгрузка блока ISS -> DataFrame (имена колонок в нижнем регистре)."""
+    rows, start = [], 0
+    while True:
+        p = {"start": start, "iss.meta": "off", **(params or {})}
+        for attempt in range(3):
+            try:
+                r = session.get(f"{ISS}/{path}.json", params=p, timeout=30)
+                r.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(3)
+        blk = r.json()[block]
+        if not blk["data"]:
+            break
+        rows += [dict(zip(blk["columns"], x)) for x in blk["data"]]
+        start += len(blk["data"])
+        time.sleep(pause)
+    df = pd.DataFrame(rows)
+    df.columns = [c.lower() for c in df.columns]
+    return df
 
 
 def collect_companies_data(years=None, limit=None, save_to=OUTPUT_FILENAME):
-    """-> [{'ticker': '', 'inn': '7707083893', 'name': ''}, ...] по всем ИНН из RFSD.
+    """-> [{'ticker': 'RU000A0JX0J2', 'inn': '7707083893', 'name': 'Эмитент'}, ...]
+    по эмитентам облигаций Мосбиржи, допущенным к торгам с MIN_YEAR года и позже (одна запись на ИНН).
 
-    years  - ограничить годы RFSD (по умолчанию MIN_YEAR..MAX_YEAR из config.py);
+    years  - не используется (оставлен для совместимости); отсечка берётся из MIN_YEAR;
     limit  - взять только первые N ИНН (для отладки);
-    save_to - CSV со списком ИНН и годами присутствия в RFSD (None = не сохранять).
+    save_to - CSV со списком эмитентов (None = не сохранять).
     """
-    print("1. Сбор списка ИНН из RFSD...")
-    df = rfsd.list_inns(years)
-    if df.empty:
-        print("Ошибка: в RFSD не найдено ни одного ИНН.")
+    print("1. Сбор эмитентов облигаций с Мосбиржи...")
+    with requests.Session() as s:
+        ref = _fetch(s, "securities", "securities", {"engine": "stock", "market": "bonds"})
+        lst = _fetch(s, "history/engines/stock/markets/bonds/listing", "securities")
+    if ref.empty or lst.empty:
+        print("Ошибка: MOEX ISS не вернул данные.")
         return []
-    print(f"Найдено {len(df)} уникальных ИНН в RFSD.")
+
+    # даты допуска/последних торгов (имена колонок на Мосбирже содержат from/till)
+    c_from = next((c for c in lst.columns if "from" in c), None)
+    c_till = next((c for c in lst.columns if "till" in c), None)
+    if not c_till:
+        print(f"Ошибка: в листинге нет колонки с датой окончания торгов: {lst.columns.tolist()}")
+        return []
+    lst[c_till] = pd.to_datetime(lst[c_till], errors="coerce")
+    agg_spec = {"last_trade": (c_till, "max")}
+    if c_from:
+        lst[c_from] = pd.to_datetime(lst[c_from], errors="coerce")
+        agg_spec["first_trade"] = (c_from, "min")
+    agg = lst.groupby("secid").agg(**agg_spec).reset_index()
+    # торговались в MIN_YEAR или позже (включая уже выбывшие бумаги)
+    agg = agg[agg["last_trade"] >= pd.Timestamp(MIN_YEAR, 1, 1)]
+
+    full = agg.merge(ref, on="secid", how="left")
+    if "emitent_inn" not in full.columns:
+        print(f"Ошибка: в справочнике бумаг нет emitent_inn: {ref.columns.tolist()}")
+        return []
+    full["emitent_inn"] = full["emitent_inn"].astype("string").str.strip()
+    no_inn = full["emitent_inn"].isna() | ~full["emitent_inn"].str.fullmatch(r"\d{10}|\d{12}", na=False)
+    print(f"Выпусков с {MIN_YEAR} г.: {len(full)}, без корректного ИНН эмитента: {int(no_inn.sum())}")
+    full = full[~no_inn]
+
+    name_col = "emitent_title" if "emitent_title" in full.columns else "shortname"
+    df = (full.sort_values("last_trade", ascending=False)
+              .groupby("emitent_inn", as_index=False)
+              .agg(ticker=("secid", "first"), name=(name_col, "first"),
+                   n_issues=("secid", "nunique"),
+                   first_trade=("first_trade", "min") if "first_trade" in full.columns else ("last_trade", "min"),
+                   last_trade=("last_trade", "max"))
+              .rename(columns={"emitent_inn": "inn"})
+              .sort_values("inn", ignore_index=True))
+    print(f"Найдено {len(df)} уникальных ИНН эмитентов облигаций.")
 
     if save_to:
         try:
-            # CSV, а не Excel: ИНН может быть больше миллиона (лимит строк Excel - 1 048 576)
             df.to_csv(save_to, index=False, sep=";", encoding="utf-8-sig")
-            print(f"Список ИНН сохранён в файл: {save_to}")
+            print(f"Список эмитентов сохранён в файл: {save_to}")
         except PermissionError:
             print(f"[ОШИБКА!] Закройте файл {save_to} и запустите программу заново.")
 
     if limit:
         df = df.head(int(limit))
-    return [{"ticker": "", "inn": inn, "name": ""} for inn in df["inn"]]
-
-
-def collect_companies_data_moex():
-    """Прежний способ: тикеры и ИНН с Мосбиржи (ISS API). Нужны requests, apimoex, pandas."""
-    import pandas as pd
-    import requests
-    import apimoex
-
-    start_year, end_year = 2018, 2026
-    years = list(range(start_year, end_year + 1))
-    status_by_year = {}
-    with requests.Session() as session:
-        print("1. Сбор базового списка акций с Мосбиржи...")
-        securities = apimoex.get_board_securities(session, board='TQBR', market='shares', engine='stock')
-        if not securities:
-            print("Ошибка: не удалось получить данные от MOEX ISS.")
-            return []
-        df_sec = pd.DataFrame(securities)
-        ticker_dict = dict(zip(df_sec['SECID'], df_sec['SHORTNAME']))
-        print(f"Найдено {len(ticker_dict)} уникальных тикеров. Начинаем сбор ИНН...")
-        for idx, (ticker, shortname) in enumerate(ticker_dict.items(), 1):
-            inn = "Не найден"
-            try:
-                url = f"https://iss.moex.com/iss/securities.json?q={ticker}&iss.meta=off&iss.only=securities"
-                response = session.get(url, timeout=5)
-                if response.status_code == 200:
-                    raw = response.json()
-                    cols = [c.lower() for c in raw['securities']['columns']]
-                    if 'secid' in cols and 'emitent_inn' in cols:
-                        si, ii = cols.index('secid'), cols.index('emitent_inn')
-                        for r in raw['securities']['data']:
-                            if r[si] == ticker and r[ii] and str(r[ii]).strip() not in ["", "nan", "None"]:
-                                inn = str(r[ii]).strip()
-                                break
-            except Exception as e:
-                print(f"[{idx}/{len(ticker_dict)}] {ticker}: ИНН не получен ({type(e).__name__}: {e})")
-            status_by_year[ticker] = {'Название': shortname, 'ИНН': inn}
-            print(f"[{idx}/{len(ticker_dict)}] ИНН {inn} (тикер {ticker}, {shortname})")
-            time.sleep(0.04)
-    return [{'ticker': t, 'inn': d['ИНН'], 'name': d['Название']} for t, d in status_by_year.items()]
-
-
-if __name__ == "__main__":
-    result = collect_companies_data(limit=1000)
-    print("\nРезультат функции (первые 3 компании):")
-    print(result[:3])
+    return [{"ticker": r.ticker, "inn": r.inn, "name": r.name or ""} for r in df.itertuples()]
